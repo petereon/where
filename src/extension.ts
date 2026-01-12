@@ -2,8 +2,48 @@ import * as vscode from 'vscode';
 import * as child_process from 'child_process';
 import * as path from 'path';
 
+// Module-level constants
+const ANSI_REGEX = /\x1b\[[0-9;]*m/g;
+
+// Utility functions
+function stripAnsiCodes(text: string): string {
+    return text.replace(ANSI_REGEX, '');
+}
+
+function parseSearchLine(line: string): { file: string; line: number; content: string } | null {
+    const match = line.match(/^([^:]+):(\d+):(.*)$/);
+    if (!match) return null;
+    return { file: match[1], line: parseInt(match[2], 10), content: match[3] };
+}
+
+function getSearchConfig() {
+    const config = vscode.workspace.getConfiguration('where');
+    return {
+        rgPath: config.get<string>('rgPath', 'rg'),
+        fzfPath: config.get<string>('fzfPath', 'fzf'),
+        rgArgs: config.get<string>('rgArgs', '--line-number --glob=!node_modules --glob=!.git --glob=!dist --glob=!out --glob=!build'),
+        maxResults: config.get<number>('maxResults', 100)
+    };
+}
+
+async function openFileAtLine(filePath: string, line: number) {
+    const document = await vscode.workspace.openTextDocument(filePath);
+    const editor = await vscode.window.showTextDocument(document);
+    const position = new vscode.Position(line, 0);
+    editor.selection = new vscode.Selection(position, position);
+    editor.revealRange(
+        new vscode.Range(position, position),
+        vscode.TextEditorRevealType.InCenter
+    );
+}
+
 class SearchInputViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
+    private readonly _onSearch = new vscode.EventEmitter<{ query: string; filter: string }>();
+    private readonly _onClear = new vscode.EventEmitter<void>();
+
+    readonly onSearch = this._onSearch.event;
+    readonly onClear = this._onClear.event;
 
     constructor(private readonly _extensionUri: vscode.Uri) {}
 
@@ -19,15 +59,15 @@ class SearchInputViewProvider implements vscode.WebviewViewProvider {
             localResourceRoots: [this._extensionUri]
         };
 
-        webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
+        webviewView.webview.html = this._getHtmlForWebview();
 
         webviewView.webview.onDidReceiveMessage(async data => {
             switch (data.type) {
                 case 'search':
-                    await this.handleSearch(data.query, data.filenameFilter);
+                    this.handleSearch(data.query, data.filenameFilter);
                     break;
                 case 'clear':
-                    await this.handleClear();
+                    this.handleClear();
                     break;
                 case 'openFile':
                     await this.openFile(data.file, data.line);
@@ -37,55 +77,43 @@ class SearchInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     public focusSearch() {
-        if (this._view) {
-            this._view.show?.(true);
-            this._view.webview.postMessage({ type: 'focus' });
-        }
+        this._view?.show?.(true);
+        this._view?.webview.postMessage({ type: 'focus' });
     }
 
     private async openFile(file: string, line: number) {
         try {
-            const document = await vscode.workspace.openTextDocument(file);
-            const editor = await vscode.window.showTextDocument(document);
-            const position = new vscode.Position(line, 0);
-            editor.selection = new vscode.Selection(position, position);
-            editor.revealRange(
-                new vscode.Range(position, position),
-                vscode.TextEditorRevealType.InCenter
-            );
+            await openFileAtLine(file, line);
         } catch (error) {
             vscode.window.showErrorMessage(`Failed to open file: ${error}`);
         }
-    }
-
-    private onSearchCallback?: (query: string, filenameFilter: string) => Promise<void>;
-    private onClearCallback?: () => void;
-
-    public setSearchCallback(callback: (query: string, filenameFilter: string) => Promise<void>) {
-        this.onSearchCallback = callback;
-    }
-
-    public setClearCallback(callback: () => void) {
-        this.onClearCallback = callback;
     }
 
     public showMessage(text: string) {
         this._view?.webview.postMessage({ type: 'message', text });
     }
 
-    private async handleSearch(query: string, filenameFilter: string) {
-        if (this.onSearchCallback) {
-            await this.onSearchCallback(query, filenameFilter);
+    public formatResultMessage(current: number, total: number, max: number): string {
+        let msg = `Found ${current}`;
+        if (current < total || total > max) {
+            msg += ` of ${total > max ? max + '+' : total}`;
         }
+        return msg;
     }
 
-    private async handleClear() {
-        if (this.onClearCallback) {
-            this.onClearCallback();
-        }
+    private handleSearch(query: string, filenameFilter: string) {
+        this._onSearch.fire({ query, filter: filenameFilter });
     }
 
-    private _getHtmlForWebview(webview: vscode.Webview) {
+    private handleClear() {
+        this._onClear.fire();
+    }
+
+    private _getHtmlForWebview() {
+        return this._getHtmlTemplate();
+    }
+
+    private _getHtmlTemplate() {
         return `<!DOCTYPE html>
         <html lang="en">
         <head>
@@ -238,7 +266,6 @@ class SearchResultsProvider implements vscode.TreeDataProvider<SearchResultItem>
 
     getChildren(element?: SearchResultItem): Thenable<SearchResultItem[]> {
         if (!element) {
-            // Root level - show files
             if (this.results.size === 0) {
                 return Promise.resolve([]);
             }
@@ -254,26 +281,27 @@ class SearchResultsProvider implements vscode.TreeDataProvider<SearchResultItem>
                 ));
             }
             return Promise.resolve(items);
-        } else if (element.type === 'file') {
-            // Show line matches for this file
-            const matches = this.results.get(element.filePath);
-            if (!matches) {
-                return Promise.resolve([]);
-            }
-
-            return Promise.resolve(matches.map(match =>
-                new SearchResultItem(
-                    match.content,
-                    element.filePath,
-                    match.line,
-                    vscode.TreeItemCollapsibleState.None,
-                    'match',
-                    match.line
-                )
-            ));
         }
 
-        return Promise.resolve([]);
+        if (element.type !== 'file') {
+            return Promise.resolve([]);
+        }
+
+        const matches = this.results.get(element.filePath);
+        if (!matches) {
+            return Promise.resolve([]);
+        }
+
+        return Promise.resolve(matches.map(match =>
+            new SearchResultItem(
+                match.content,
+                element.filePath,
+                match.line,
+                vscode.TreeItemCollapsibleState.None,
+                'match',
+                match.line
+            )
+        ));
     }
 }
 
@@ -319,40 +347,39 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider('whereSearchInput', searchInputProvider)
     );
 
-    // Set up clear callback
-    searchInputProvider.setClearCallback(() => {
-        resultsProvider.clear();
-    });
+    // Set up event handlers
+    context.subscriptions.push(
+        searchInputProvider.onClear(() => {
+            resultsProvider.clear();
+        })
+    );
 
-    // Set up search callback with batching
-    searchInputProvider.setSearchCallback(async (query: string, filenameFilter: string) => {
+    context.subscriptions.push(
+        searchInputProvider.onSearch(async ({ query, filter }) => {
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
             searchInputProvider.showMessage('No workspace folder open');
             return;
         }
 
-        if (!query.trim() && !filenameFilter.trim()) {
+        if (!query.trim() && !filter.trim()) {
             searchInputProvider.showMessage('Please enter a search query or filename filter');
             return;
         }
 
-        const config = vscode.workspace.getConfiguration('where');
-        const rgPath = config.get<string>('rgPath', 'rg');
-        const fzfPath = config.get<string>('fzfPath', 'fzf');
-        const rgArgs = config.get<string>('rgArgs', '--line-number --glob=!node_modules --glob=!.git --glob=!dist --glob=!out --glob=!build');
-        const maxResults = config.get<number>('maxResults', 100);
+        const { rgPath, fzfPath, rgArgs, maxResults } = getSearchConfig();
 
         const binaries = [
             { name: 'rg', path: rgPath },
             { name: 'fzf', path: fzfPath }
         ];
 
-        for (const binary of binaries) {
-            if (!await checkBinaryExists(binary.path)) {
-                searchInputProvider.showMessage(`Binary '${binary.name}' not found`);
-                return;
-            }
+        const checks = binaries.map(b => checkBinaryExists(b.path));
+        const results = await Promise.all(checks);
+        const missingBinary = binaries.find((_, i) => !results[i]);
+        if (missingBinary) {
+            searchInputProvider.showMessage(`Binary '${missingBinary.name}' not found`);
+            return;
         }
 
         resultsProvider.clear();
@@ -365,12 +392,12 @@ export function activate(context: vscode.ExtensionContext) {
                 rgArgs,
                 fzfPath,
                 query,
-                filenameFilter,
+                filter,
                 workspacePath
             );
 
             if (rawResults.length === 0) {
-                searchInputProvider.showMessage(`No results found`);
+                searchInputProvider.showMessage('No results found');
                 return;
             }
 
@@ -381,11 +408,16 @@ export function activate(context: vscode.ExtensionContext) {
             for (let i = 0; i < totalToShow; i += batchSize) {
                 const batch = rawResults.slice(i, Math.min(i + batchSize, totalToShow));
                 const searchResults: SearchResult[] = batch.map((result: RawSearchResult) => {
-                    const parts = result.rawLine.split(':');
-                    const file = path.isAbsolute(parts[0]) ? parts[0] : path.join(workspacePath, parts[0]);
-                    const line = parseInt(parts[1], 10);
-                    const content = parts.slice(2).join(':').trim();
-                    return { file, line, content };
+                    const parsed = parseSearchLine(result.rawLine);
+                    if (!parsed) {
+                        const parts = result.rawLine.split(':');
+                        const file = path.isAbsolute(parts[0]) ? parts[0] : path.join(workspacePath, parts[0]);
+                        const line = parseInt(parts[1], 10);
+                        const content = parts.slice(2).join(':').trim();
+                        return { file, line, content };
+                    }
+                    const file = path.isAbsolute(parsed.file) ? parsed.file : path.join(workspacePath, parsed.file);
+                    return { file, line: parsed.line, content: parsed.content.trim() };
                 });
 
                 if (i === 0) {
@@ -394,13 +426,11 @@ export function activate(context: vscode.ExtensionContext) {
                     resultsProvider.addResults(searchResults);
                 }
 
-                // Update messraw current count
+                // Update current count
                 const currentCount = Math.min(i + batchSize, totalToShow);
-                let message = `Found ${currentCount}`;
-                if (currentCount < totalToShow || rawResults.length > maxResults) {
-                    message += ` of ${rawResults.length > maxResults ? maxResults + '+' : rawResults.length}`;
-                }
-                searchInputProvider.showMessage(message);
+                searchInputProvider.showMessage(
+                    searchInputProvider.formatResultMessage(currentCount, rawResults.length, maxResults)
+                );
 
                 // Small delay between batches for UI responsiveness
                 if (i + batchSize < totalToShow) {
@@ -417,20 +447,13 @@ export function activate(context: vscode.ExtensionContext) {
         } catch (error) {
             searchInputProvider.showMessage(`Search failed: ${error}`);
         }
-    });
+    })
+    );
 
     // Register command to open a result
     context.subscriptions.push(
         vscode.commands.registerCommand('where.openResult', async (filePath: string, line: number) => {
-            const document = await vscode.workspace.openTextDocument(filePath);
-            const editor = await vscode.window.showTextDocument(document);
-
-            const position = new vscode.Position(line, 0);
-            editor.selection = new vscode.Selection(position, position);
-            editor.revealRange(
-                new vscode.Range(position, position),
-                vscode.TextEditorRevealType.InCenter
-            );
+            await openFileAtLine(filePath, line);
         })
     );
 
@@ -444,6 +467,108 @@ export function activate(context: vscode.ExtensionContext) {
 
 interface RawSearchResult {
     rawLine: string;
+}
+
+function runRipgrep(rgPath: string, rgArgs: string, cwd: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const rgProcess = child_process.spawn(rgPath, [...rgArgs.split(' '), '\\S'], {
+            cwd,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        let rgOutput = '';
+        let rgError = '';
+
+        rgProcess.stdout.on('data', (data) => {
+            rgOutput += data.toString();
+        });
+
+        rgProcess.stderr.on('data', (data) => {
+            rgError += data.toString();
+        });
+
+        rgProcess.on('close', (rgCode) => {
+            if (rgCode !== 0 && rgCode !== 1) {
+                reject(new Error(`ripgrep failed: ${rgError}`));
+                return;
+            }
+            resolve(rgOutput);
+        });
+    });
+}
+
+function filterByFilename(fzfPath: string, filenames: string[], filter: string, cwd: string): Promise<Set<string>> {
+    return new Promise((resolve, reject) => {
+        const fzfProcess = child_process.spawn(fzfPath, ['--filter', filter, '--ansi'], {
+            cwd,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        let fzfOutput = '';
+        let fzfError = '';
+
+        fzfProcess.stdout.on('data', (data) => {
+            fzfOutput += data.toString();
+        });
+
+        fzfProcess.stderr.on('data', (data) => {
+            fzfError += data.toString();
+        });
+
+        fzfProcess.on('close', (code) => {
+            if (code !== 0 && code !== 1) {
+                reject(new Error(`fzf filename filter failed: ${fzfError}`));
+                return;
+            }
+
+            const matchedFilenames = new Set(
+                fzfOutput
+                    .split('\n')
+                    .filter(line => line.trim())
+                    .map(line => stripAnsiCodes(line))
+            );
+            resolve(matchedFilenames);
+        });
+
+        fzfProcess.stdin.write(filenames.join('\n'));
+        fzfProcess.stdin.end();
+    });
+}
+
+function filterByContent(fzfPath: string, contentLines: string[], query: string, cwd: string): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+        const fzfProcess = child_process.spawn(fzfPath, ['--filter', query, '--ansi'], {
+            cwd,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        let fzfOutput = '';
+        let fzfError = '';
+
+        fzfProcess.stdout.on('data', (data) => {
+            fzfOutput += data.toString();
+        });
+
+        fzfProcess.stderr.on('data', (data) => {
+            fzfError += data.toString();
+        });
+
+        fzfProcess.on('close', (code) => {
+            if (code !== 0 && code !== 1) {
+                reject(new Error(`fzf failed: ${fzfError}`));
+                return;
+            }
+
+            const matched = fzfOutput
+                .split('\n')
+                .filter(line => line.trim())
+                .map(line => stripAnsiCodes(line));
+            resolve(matched);
+        });
+
+        fzfProcess.stdin.write(contentLines.join('\n'));
+        fzfProcess.stdin.end();
+    });
 }
 
 function executeSearch(
