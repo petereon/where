@@ -1,0 +1,96 @@
+{
+  "name": "where",
+  "displayName": "where",
+  "description": "Search project files using rg and fzf",
+  "version": "0.0.1",
+  "publisher": "petervyboch",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/petervyboch/where"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "where.focusSearch",
+        "title": "where: Focus Search"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "where",
+          "title": "where",
+          "icon": "$(search)"
+        }
+      ]
+    },
+    "views": {
+      "where": [
+        {
+          "id": "whereSearchInput",
+          "name": "Search",
+          "type": "webview"
+        },
+        {
+          "id": "whereSearchResults",
+          "name": "Results"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "where.focusSearch",
+        "key": "ctrl+shift+alt+f",
+        "mac": "cmd+shift+alt+f"
+      }
+    ],
+    "configuration": {
+      "title": "where",
+      "properties": {
+        "where.rgPath": {
+          "type": "string",
+          "default": "rg",
+          "description": "Path to ripgrep (rg) executable"
+        },
+        "where.fzfPath": {
+          "type": "string",
+          "default": "fzf",
+          "description": "Path to fzf executable"
+        },
+        "where.rgArgs": {
+          "type": "string",
+          "default": "--line-number --glob=!node_modules --glob=!.git --glob=!dist --glob=!out --glob=!build",
+          "description": "Additional arguments for ripgrep"
+        },
+        "where.maxResults": {
+          "type": "number",
+          "default": 100,
+          "description": "Maximum number of results to display"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^6.x",
+    "@typescript-eslint/parser": "^6.x",
+    "eslint": "^8.x",
+    "typescript": "^5.x"
+  }
+}
