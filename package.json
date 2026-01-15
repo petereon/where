@@ -2,7 +2,7 @@
   "name": "where",
   "displayName": "where",
   "description": "Search project files using rg and fzf",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "petereon",
   "icon": "icon.ico",
   "repository": {
@@ -68,8 +68,13 @@
         },
         "where.rgArgs": {
           "type": "string",
-          "default": "--line-number --glob=!node_modules --glob=!.git --glob=!dist --glob=!out --glob=!build",
-          "description": "Additional arguments for ripgrep"
+          "default": "",
+          "description": "Additional arguments for ripgrep (--line-number is always included automatically)"
+        },
+        "where.respectGitignore": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically exclude patterns from .gitignore"
         },
         "where.maxResults": {
           "type": "number",
