@@ -4,6 +4,7 @@
   "description": "Search project files using rg and fzf",
   "version": "0.0.1",
   "publisher": "petervyboch",
+  "icon": "icon.ico",
   "repository": {
     "type": "git",
     "url": "https://github.com/petervyboch/where"

@@ -1,6 +1,13 @@
 import * as vscode from 'vscode';
 import * as child_process from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';
+import * as https from 'https';
+import * as os from 'os';
+import { promisify } from 'util';
+
+const chmod = promisify(fs.chmod);
+const mkdir = promisify(fs.mkdir);
 
 // Module-level constants
 const ANSI_REGEX = /\x1b\[[0-9;]*m/g;
@@ -93,10 +100,10 @@ class SearchInputViewProvider implements vscode.WebviewViewProvider {
         this._view?.webview.postMessage({ type: 'message', text });
     }
 
-    public formatResultMessage(current: number, total: number, max: number): string {
-        let msg = `Found ${current}`;
-        if (current < total || total > max) {
-            msg += ` of ${total > max ? max + '+' : total}`;
+    public formatResultMessage(current: number, total: number): string {
+        let msg = `Found ${total}`;
+        if (current < total) {
+            msg += ` of ${total}`;
         }
         return msg;
     }
@@ -224,6 +231,10 @@ class SearchResultsProvider implements vscode.TreeDataProvider<SearchResultItem>
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
     private results: Map<string, SearchResult[]> = new Map();
+    private allRawResults: RawSearchResult[] = [];
+    private currentlyDisplayed: number = 0;
+    private workspacePath: string = '';
+    private batchSize: number = 100;
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -231,33 +242,64 @@ class SearchResultsProvider implements vscode.TreeDataProvider<SearchResultItem>
 
     clear(): void {
         this.results.clear();
+        this.allRawResults = [];
+        this.currentlyDisplayed = 0;
         this.refresh();
     }
 
-    setResults(results: SearchResult[]): void {
+    setAllResults(rawResults: RawSearchResult[], workspacePath: string): void {
+        this.allRawResults = rawResults;
+        this.workspacePath = workspacePath;
         this.results.clear();
-
-        // Group results by file
-        for (const result of results) {
-            if (!this.results.has(result.file)) {
-                this.results.set(result.file, []);
-            }
-            this.results.get(result.file)!.push(result);
-        }
-
-        this.refresh();
+        this.currentlyDisplayed = 0;
+        this.loadMoreResults(this.batchSize);
     }
 
-    addResults(results: SearchResult[]): void {
-        // Group results by file
-        for (const result of results) {
+    loadMoreResults(count: number): boolean {
+        const startIndex = this.currentlyDisplayed;
+        const endIndex = Math.min(startIndex + count, this.allRawResults.length);
+
+        if (startIndex >= this.allRawResults.length) {
+            return false; // No more results to load
+        }
+
+        const batch = this.allRawResults.slice(startIndex, endIndex);
+        const searchResults: SearchResult[] = batch.map((result: RawSearchResult) => {
+            const parsed = parseSearchLine(result.rawLine);
+            if (!parsed) {
+                const parts = result.rawLine.split(':');
+                const file = path.isAbsolute(parts[0]) ? parts[0] : path.join(this.workspacePath, parts[0]);
+                const line = parseInt(parts[1], 10);
+                const content = parts.slice(2).join(':').trim();
+                return { file, line, content };
+            }
+            const file = path.isAbsolute(parsed.file) ? parsed.file : path.join(this.workspacePath, parsed.file);
+            return { file, line: parsed.line, content: parsed.content.trim() };
+        });
+
+        // Add to results
+        for (const result of searchResults) {
             if (!this.results.has(result.file)) {
                 this.results.set(result.file, []);
             }
             this.results.get(result.file)!.push(result);
         }
 
+        this.currentlyDisplayed = endIndex;
         this.refresh();
+        return endIndex < this.allRawResults.length; // Return true if more results available
+    }
+
+    hasMoreResults(): boolean {
+        return this.currentlyDisplayed < this.allRawResults.length;
+    }
+
+    getTotalResultCount(): number {
+        return this.allRawResults.length;
+    }
+
+    getDisplayedResultCount(): number {
+        return this.currentlyDisplayed;
     }
 
     getTreeItem(element: SearchResultItem): vscode.TreeItem {
@@ -280,6 +322,18 @@ class SearchResultsProvider implements vscode.TreeDataProvider<SearchResultItem>
                     'file'
                 ));
             }
+
+            // Add "Load More" item if there are more results
+            if (this.hasMoreResults()) {
+                items.push(new SearchResultItem(
+                    `Load More (${this.currentlyDisplayed} of ${this.allRawResults.length} shown)`,
+                    '',
+                    0,
+                    vscode.TreeItemCollapsibleState.None,
+                    'loadMore'
+                ));
+            }
+
             return Promise.resolve(items);
         }
 
@@ -311,7 +365,7 @@ class SearchResultItem extends vscode.TreeItem {
         public readonly filePath: string,
         public readonly matchCount: number,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
-        public readonly type: 'file' | 'match',
+        public readonly type: 'file' | 'match' | 'loadMore',
         public readonly line?: number
     ) {
         super(label, collapsibleState);
@@ -321,6 +375,14 @@ class SearchResultItem extends vscode.TreeItem {
             this.contextValue = 'file';
             this.resourceUri = vscode.Uri.file(filePath);
             this.tooltip = filePath;
+        } else if (type === 'loadMore') {
+            this.contextValue = 'loadMore';
+            this.command = {
+                command: 'where.loadMore',
+                title: 'Load More'
+            };
+            this.iconPath = new vscode.ThemeIcon('unfold');
+            this.tooltip = 'Click to load more results';
         } else {
             this.contextValue = 'match';
             this.description = `Line ${line}`;
@@ -347,6 +409,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider('whereSearchInput', searchInputProvider)
     );
 
+    // Check and offer to install binaries on activation
+    checkAndOfferToInstallBinaries(context).then(result => {
+        if (result) {
+            vscode.window.showInformationMessage('Where extension is ready to use!');
+        }
+    });
+
     // Set up event handlers
     context.subscriptions.push(
         searchInputProvider.onClear(() => {
@@ -367,7 +436,7 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
 
-        const { rgPath, fzfPath, rgArgs, maxResults } = getSearchConfig();
+        const { rgPath, fzfPath, rgArgs } = getSearchConfig();
 
         const binaries = [
             { name: 'rg', path: rgPath },
@@ -401,47 +470,15 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            // Process results in batches for responsiveness
-            const batchSize = 20;
-            const totalToShow = Math.min(rawResults.length, maxResults);
+            // Load all results into provider (will display first batch)
+            resultsProvider.setAllResults(rawResults, workspacePath);
 
-            for (let i = 0; i < totalToShow; i += batchSize) {
-                const batch = rawResults.slice(i, Math.min(i + batchSize, totalToShow));
-                const searchResults: SearchResult[] = batch.map((result: RawSearchResult) => {
-                    const parsed = parseSearchLine(result.rawLine);
-                    if (!parsed) {
-                        const parts = result.rawLine.split(':');
-                        const file = path.isAbsolute(parts[0]) ? parts[0] : path.join(workspacePath, parts[0]);
-                        const line = parseInt(parts[1], 10);
-                        const content = parts.slice(2).join(':').trim();
-                        return { file, line, content };
-                    }
-                    const file = path.isAbsolute(parsed.file) ? parsed.file : path.join(workspacePath, parsed.file);
-                    return { file, line: parsed.line, content: parsed.content.trim() };
-                });
-
-                if (i === 0) {
-                    resultsProvider.setResults(searchResults);
-                } else {
-                    resultsProvider.addResults(searchResults);
-                }
-
-                // Update current count
-                const currentCount = Math.min(i + batchSize, totalToShow);
-                searchInputProvider.showMessage(
-                    searchInputProvider.formatResultMessage(currentCount, rawResults.length, maxResults)
-                );
-
-                // Small delay between batches for UI responsiveness
-                if (i + batchSize < totalToShow) {
-                    await new Promise(resolve => setTimeout(resolve, 10));
-                }
-            }
-
-            // Final message
-            let message = `Found ${totalToShow} result${totalToShow !== 1 ? 's' : ''}`;
-            if (rawResults.length > maxResults) {
-                message += ` (showing first ${maxResults} of ${rawResults.length})`;
+            // Show message
+            const displayed = resultsProvider.getDisplayedResultCount();
+            const total = resultsProvider.getTotalResultCount();
+            let message = `Found ${total} result${total !== 1 ? 's' : ''}`;
+            if (displayed < total) {
+                message += ` (showing first ${displayed})`;
             }
             searchInputProvider.showMessage(message);
         } catch (error) {
@@ -454,6 +491,17 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('where.openResult', async (filePath: string, line: number) => {
             await openFileAtLine(filePath, line);
+        })
+    );
+
+    // Register command to load more results
+    context.subscriptions.push(
+        vscode.commands.registerCommand('where.loadMore', () => {
+            resultsProvider.loadMoreResults(100);
+            const displayed = resultsProvider.getDisplayedResultCount();
+            const total = resultsProvider.getTotalResultCount();
+            let message = `Showing ${displayed} of ${total} result${total !== 1 ? 's' : ''}`;
+            searchInputProvider.showMessage(message);
         })
     );
 
@@ -796,6 +844,293 @@ function checkBinaryExists(binaryPath: string): Promise<boolean> {
             resolve(!error);
         });
     });
+}
+
+function getBinariesDir(context: vscode.ExtensionContext): string {
+    return path.join(context.globalStorageUri.fsPath, 'bin');
+}
+
+async function ensureBinariesDir(context: vscode.ExtensionContext): Promise<string> {
+    const binDir = getBinariesDir(context);
+    if (!fs.existsSync(binDir)) {
+        await mkdir(binDir, { recursive: true });
+    }
+    return binDir;
+}
+
+function getPlatformInfo(): { platform: string; arch: string; isSupported: boolean } {
+    const platform = os.platform();
+    const arch = os.arch();
+    const isSupported = ['darwin', 'linux', 'win32'].includes(platform);
+    return { platform, arch, isSupported };
+}
+
+function getRipgrepDownloadUrl(): { url: string; filename: string } | null {
+    const { platform, arch } = getPlatformInfo();
+    const version = '14.1.0';
+    let filename: string;
+
+    if (platform === 'darwin') {
+        if (arch === 'arm64') {
+            filename = `ripgrep-${version}-aarch64-apple-darwin.tar.gz`;
+        } else {
+            filename = `ripgrep-${version}-x86_64-apple-darwin.tar.gz`;
+        }
+    } else if (platform === 'linux') {
+        if (arch === 'x64') {
+            filename = `ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz`;
+        } else if (arch === 'arm64') {
+            filename = `ripgrep-${version}-aarch64-unknown-linux-gnu.tar.gz`;
+        } else {
+            return null;
+        }
+    } else if (platform === 'win32') {
+        filename = `ripgrep-${version}-x86_64-pc-windows-msvc.zip`;
+    } else {
+        return null;
+    }
+
+    return {
+        url: `https://github.com/BurntSushi/ripgrep/releases/download/${version}/${filename}`,
+        filename
+    };
+}
+
+function getFzfDownloadUrl(): { url: string; filename: string } | null {
+    const { platform, arch } = getPlatformInfo();
+    const version = '0.56.3';
+    let filename: string;
+
+    if (platform === 'darwin') {
+        if (arch === 'arm64') {
+            filename = 'fzf-' + version + '-darwin_arm64.tar.gz';
+        } else {
+            filename = 'fzf-' + version + '-darwin_amd64.tar.gz';
+        }
+    } else if (platform === 'linux') {
+        if (arch === 'x64') {
+            filename = 'fzf-' + version + '-linux_amd64.tar.gz';
+        } else if (arch === 'arm64') {
+            filename = 'fzf-' + version + '-linux_arm64.tar.gz';
+        } else {
+            return null;
+        }
+    } else if (platform === 'win32') {
+        filename = 'fzf-' + version + '-windows_amd64.zip';
+    } else {
+        return null;
+    }
+
+    return {
+        url: `https://github.com/junegunn/fzf/releases/download/v${version}/${filename}`,
+        filename
+    };
+}
+
+function downloadFile(url: string, destPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(destPath);
+        https.get(url, (response) => {
+            if (response.statusCode === 302 || response.statusCode === 301) {
+                // Handle redirect
+                const redirectUrl = response.headers.location;
+                if (redirectUrl) {
+                    file.close();
+                    fs.unlinkSync(destPath);
+                    downloadFile(redirectUrl, destPath).then(resolve).catch(reject);
+                    return;
+                }
+            }
+
+            if (response.statusCode !== 200) {
+                file.close();
+                fs.unlinkSync(destPath);
+                reject(new Error(`Failed to download: ${response.statusCode}`));
+                return;
+            }
+
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', (err) => {
+            file.close();
+            fs.unlinkSync(destPath);
+            reject(err);
+        });
+    });
+}
+
+function extractArchive(archivePath: string, destDir: string, binaryName: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const isZip = archivePath.endsWith('.zip');
+        const command = isZip
+            ? `unzip -o "${archivePath}" -d "${destDir}"`
+            : `tar -xzf "${archivePath}" -C "${destDir}"`;
+
+        child_process.exec(command, async (error) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+
+            // Find the binary in the extracted files
+            const findBinary = (dir: string): string | null => {
+                const files = fs.readdirSync(dir);
+                for (const file of files) {
+                    const fullPath = path.join(dir, file);
+                    const stat = fs.statSync(fullPath);
+                    if (stat.isDirectory()) {
+                        const found = findBinary(fullPath);
+                        if (found) return found;
+                    } else if (file === binaryName || file === `${binaryName}.exe`) {
+                        return fullPath;
+                    }
+                }
+                return null;
+            };
+
+            const binaryPath = findBinary(destDir);
+            if (!binaryPath) {
+                reject(new Error(`Binary ${binaryName} not found in archive`));
+                return;
+            }
+
+            // Make executable (Unix only)
+            if (os.platform() !== 'win32') {
+                await chmod(binaryPath, 0o755);
+            }
+
+            // Move to bin dir if not already there
+            const ext = os.platform() === 'win32' ? '.exe' : '';
+            const finalPath = path.join(destDir, binaryName + ext);
+            if (binaryPath !== finalPath) {
+                fs.renameSync(binaryPath, finalPath);
+            }
+
+            resolve(finalPath);
+        });
+    });
+}
+
+async function downloadAndInstallBinary(
+    name: 'rg' | 'fzf',
+    context: vscode.ExtensionContext
+): Promise<string | null> {
+    const binDir = await ensureBinariesDir(context);
+    const downloadInfo = name === 'rg' ? getRipgrepDownloadUrl() : getFzfDownloadUrl();
+
+    if (!downloadInfo) {
+        vscode.window.showErrorMessage(`Your platform is not supported for automatic ${name} installation`);
+        return null;
+    }
+
+    const archivePath = path.join(binDir, downloadInfo.filename);
+    const binaryName = name === 'rg' ? 'rg' : 'fzf';
+
+    try {
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Downloading ${name}...`,
+            cancellable: false
+        }, async (progress) => {
+            progress.report({ message: 'Downloading...' });
+            await downloadFile(downloadInfo.url, archivePath);
+
+            progress.report({ message: 'Extracting...' });
+            const installedPath = await extractArchive(archivePath, binDir, binaryName);
+
+            // Clean up archive
+            fs.unlinkSync(archivePath);
+
+            return installedPath;
+        });
+
+        const ext = os.platform() === 'win32' ? '.exe' : '';
+        const binaryPath = path.join(binDir, binaryName + ext);
+
+        vscode.window.showInformationMessage(`${name} installed successfully`);
+        return binaryPath;
+    } catch (error) {
+        vscode.window.showErrorMessage(`Failed to install ${name}: ${error}`);
+        return null;
+    }
+}
+
+async function checkAndOfferToInstallBinaries(context: vscode.ExtensionContext): Promise<{ rgPath: string; fzfPath: string } | null> {
+    const config = getSearchConfig();
+    let rgPath = config.rgPath;
+    let fzfPath = config.fzfPath;
+
+    // Check if using default paths
+    const usingDefaultRg = rgPath === 'rg';
+    const usingDefaultFzf = fzfPath === 'fzf';
+
+    // Check if binaries exist
+    const [rgExists, fzfExists] = await Promise.all([
+        checkBinaryExists(rgPath),
+        checkBinaryExists(fzfPath)
+    ]);
+
+    const missingBinaries: ('rg' | 'fzf')[] = [];
+    if (!rgExists && usingDefaultRg) missingBinaries.push('rg');
+    if (!fzfExists && usingDefaultFzf) missingBinaries.push('fzf');
+
+    if (missingBinaries.length === 0) {
+        return { rgPath, fzfPath };
+    }
+
+    // Check if platform is supported
+    const { isSupported } = getPlatformInfo();
+    if (!isSupported) {
+        const binaryNames = missingBinaries.join(' and ');
+        vscode.window.showWarningMessage(
+            `Required binaries (${binaryNames}) not found. Please install them manually.`,
+            'Learn More'
+        ).then(selection => {
+            if (selection === 'Learn More') {
+                vscode.env.openExternal(vscode.Uri.parse('https://github.com/petereon/where#requirements'));
+            }
+        });
+        return null;
+    }
+
+    // Offer to download
+    const binaryNames = missingBinaries.map(b => b === 'rg' ? 'ripgrep (rg)' : 'fzf').join(' and ');
+    const action = await vscode.window.showInformationMessage(
+        `The where extension requires ${binaryNames} to function. Would you like to download and install them automatically?`,
+        'Yes',
+        'No',
+        'Manual Installation'
+    );
+
+    if (action === 'Manual Installation') {
+        vscode.env.openExternal(vscode.Uri.parse('https://github.com/petereon/where#requirements'));
+        return null;
+    }
+
+    if (action !== 'Yes') {
+        return null;
+    }
+
+    // Download and install
+    for (const binary of missingBinaries) {
+        const installedPath = await downloadAndInstallBinary(binary, context);
+        if (installedPath) {
+            if (binary === 'rg') {
+                rgPath = installedPath;
+                await vscode.workspace.getConfiguration('where').update('rgPath', installedPath, vscode.ConfigurationTarget.Global);
+            } else {
+                fzfPath = installedPath;
+                await vscode.workspace.getConfiguration('where').update('fzfPath', installedPath, vscode.ConfigurationTarget.Global);
+            }
+        } else {
+            return null;
+        }
+    }
+
+    return { rgPath, fzfPath };
 }
 
 export function deactivate() {}

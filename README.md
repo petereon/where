@@ -5,7 +5,8 @@ A VS Code extension that wraps the powerful combination of `rg` (ripgrep) and `f
 ## Features
 
 - **Dedicated sidebar panel** with search input
-- **Instant search as you type** - results appear automatically with 300ms debounce
+- **Instant search as you type** - results appear automatically
+- **Infinite scrolling** - load more results on demand with a "Load More" button
 - **Batched result loading** for responsive UI even with large result sets
 - Fast project-wide search using ripgrep
 - Fuzzy filtering with fzf (supports exact match with `'term`, etc.)
@@ -18,8 +19,14 @@ A VS Code extension that wraps the powerful combination of `rg` (ripgrep) and `f
 
 ## Requirements
 
-This extension requires the following binaries to be installed and available in your PATH:
+This extension requires the following binaries:
 
+- `rg` (ripgrep)
+- `fzf`
+
+**Automatic Installation**: When you first activate the extension, if these binaries are not found in your system PATH, you'll be prompted to download and install them automatically. This works on macOS, Linux, and Windows.
+
+**Manual Installation**: If you prefer to install manually or if automatic installation fails:
 - `rg` (ripgrep) - [Installation guide](https://github.com/BurntSushi/ripgrep#installation)
 - `fzf` - [Installation guide](https://github.com/junegunn/fzf#installation)
 
@@ -34,7 +41,8 @@ This extension requires the following binaries to be installed and available in 
 4. Results appear in the "Results" section below as a collapsible tree view
    - Files are grouped with the number of matches
    - Expand files to see individual match lines
-   - Results load in batches for better responsiveness
+   - First 100 results load automatically
+   - Click "Load More" at the bottom to load additional results (100 at a time)
 5. Click on any result to open the file at that line
 
 ## Configuration
@@ -45,8 +53,7 @@ You can customize the extension in VS Code settings:
 {
   "where.rgPath": "rg",
   "where.fzfPath": "fzf",
-  "where.rgArgs": "--line-number --glob=!node_modules --glob=!.git --glob=!dist --glob=!out --glob=!build",
-  "where.maxResults": 100
+  "where.rgArgs": "--line-number --glob=!node_modules --glob=!.git --glob=!dist --glob=!out --glob=!build"
 }
 ```
 
